@@ -1,0 +1,52 @@
+# ---- Dados (não versionar arquivos grandes do TLC) ----
+data/
+*.parquet
+*.csv
+!data/.gitkeep
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+profile_default/
+ipython_config.py
+
+# ---- Ambientes virtuais ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Caches de ferramentas ----
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ---- Artefatos de execução / solvers ----
+*.log
+*.lp
+*.mps
+*.sol
+gurobi.log
+
+# ---- Saídas geradas pelo notebook ----
+outputs/
+figures/
+*.pkl
+*.pt
+
+# ---- SO / IDE ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
