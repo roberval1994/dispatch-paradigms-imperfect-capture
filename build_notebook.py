@@ -764,6 +764,247 @@ for key in ["alta", "media", "baixa"]:
 
 
 # ===========================================================================
+# SEÇÃO 4 — Paradigma 1: Predict-then-Optimize (PTO)
+# ===========================================================================
+def section_4():
+    return [
+        md(r"""
+## Seção 4 — Paradigma 1: Predict-then-Optimize (PTO)
+
+A ideia do PTO é desacoplar **previsão** e **decisão**: primeiro estimamos os
+parâmetros operacionais (demanda), depois resolvemos um programa matemático que
+toma a decisão ótima **dado** o parâmetro estimado.
+
+### 4.1 O desafio específico: prever a demanda REAL a partir da OBSERVADA
+
+O ponto crítico sob captação imperfeita é que treinar um preditor para reproduzir
+a demanda **observada** propaga o viés de subcaptação para a otimização. Então o
+alvo de treino é a demanda **real** $D$ (disponível no histórico de treino, *ex post*),
+e as *features* usam apenas informação legítima no instante da decisão:
+
+- calendário (hora do dia via *sin/cos*, dia da semana);
+- identidade da zona (one-hot);
+- *lags* da demanda **observada** ($O_{z,t-1}, O_{z,t-2}, \dots$) e médias móveis;
+- estimativa de confiabilidade de captação $\hat p^{capt}_{z,t}$ (ver 4.2).
+
+> Isso é, em essência, uma correção de *reporting bias*: aprendemos o mapeamento
+> $\mathcal{I}_t \mapsto \mathbb{E}[D_{z,t}]$ diretamente, em vez de modelar só $O$.
+
+### 4.2 Estimação da confiabilidade de captação
+
+No histórico de treino conhecemos $D$ e $O$, logo podemos estimar
+$\hat p^{capt}_{z,h} = \frac{\sum O}{\sum D}$ por (zona, hora). Essa tabela é
+informação legítima (vem do passado) e serve tanto de *feature* quanto de fator
+de *de-biasing* $\hat D^{\text{deb}}_{z,t} = O_{z,t} / \hat p^{capt}_{z,h(t)}$.
+
+### 4.3 Otimização acoplada
+
+Com a previsão $\hat D$, a alocação ótima do passo é separável e resolvida pelo
+MIP de alocação (equivalente ao *waterfill* quando $\lambda=0$; usamos o MIP
+explícito para permitir penalidades e manter a arquitetura PTO fiel).
+"""),
+        code(r"""
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
+
+def build_capture_reliability(D_real_sel, D_obs_sel, cfg):
+    '''Estima p_capt[zona, hora] = sum(O)/sum(D) no conjunto de TREINO.
+
+    Retorna matriz (n_zones, 24) usada como feature e para de-biasing.
+    '''
+    steps_per_hour = 60 // cfg.step_minutes
+    n_days, T, Z = D_real_sel.shape
+    hour_of_step = (np.arange(T) // steps_per_hour)  # 0..23
+    rel = np.ones((Z, 24))
+    for h in range(24):
+        mask = hour_of_step == h
+        dr = D_real_sel[:, mask, :].sum(axis=(0, 1))  # (Z,)
+        do = D_obs_sel[:, mask, :].sum(axis=(0, 1))
+        rel[:, h] = np.where(dr > 0, do / np.maximum(dr, 1), 1.0)
+    return np.clip(rel, 0.05, 1.0)
+
+
+print("Estimador de confiabilidade de captação definido.")
+"""),
+        code(r"""
+def make_features(D_obs_sel, cfg, reliability, n_lags=3):
+    '''Monta matriz de features X e metadados (dia, passo, zona) para cada
+    ponto (dia, t>=n_lags, zona). Usa SÓ informação legítima: lags da OBSERVADA,
+    calendário e a confiabilidade estimada. O alvo y é preenchido fora (real).
+
+    Retorna (X, idx) onde idx = array (N,3) com (dia_local, passo, zona).
+    '''
+    n_days, T, Z = D_obs_sel.shape
+    steps_per_hour = 60 // cfg.step_minutes
+    rows, idx = [], []
+    for d in range(n_days):
+        for t in range(n_lags, T):
+            hour = t // steps_per_hour
+            ang = 2 * np.pi * t / T
+            sin_t, cos_t = math.sin(ang), math.cos(ang)
+            for z in range(Z):
+                lags = [D_obs_sel[d, t - k, z] for k in range(1, n_lags + 1)]
+                ma = np.mean(lags)
+                zone_oh = [1.0 if zz == z else 0.0 for zz in range(Z)]
+                feat = [sin_t, cos_t, hour / 23.0, ma, reliability[z, hour]] + lags + zone_oh
+                rows.append(feat)
+                idx.append((d, t, z))
+    return np.asarray(rows, float), np.asarray(idx, int)
+
+
+def fit_pto_predictor(cfg, scenario_key):
+    '''Treina o preditor de demanda REAL para um cenário de captação.
+
+    Alvo: D_real (ex post, só no treino). Features: informação legítima.
+    Retorna (modelo, reliability, n_lags) e imprime MAE de validação.
+    '''
+    set_global_seed()
+    n_lags = 3
+    tr, va = SPLIT["train"], SPLIT["val"]
+    rel = build_capture_reliability(D_real[tr], D_OBS[scenario_key][tr], cfg)
+
+    Xtr, itr = make_features(D_OBS[scenario_key][tr], cfg, rel, n_lags)
+    ytr = np.array([D_real[tr][d, t, z] for d, t, z in itr], float)
+    Xva, iva = make_features(D_OBS[scenario_key][va], cfg, rel, n_lags)
+    yva = np.array([D_real[va][d, t, z] for d, t, z in iva], float)
+
+    model = GradientBoostingRegressor(n_estimators=200, max_depth=3,
+                                      learning_rate=0.05, subsample=0.8,
+                                      random_state=GLOBAL_SEED)
+    model.fit(Xtr, ytr)
+    mae = mean_absolute_error(yva, np.clip(model.predict(Xva), 0, None))
+    print(f"  [PTO:{scenario_key}] MAE val (demanda real) = {mae:.3f} "
+          f"| baseline de-bias MAE = "
+          f"{mean_absolute_error(yva, _debias_pred(Xva, cfg, n_lags)):.3f}")
+    return model, rel, n_lags
+
+
+def _debias_pred(X, cfg, n_lags):
+    '''Previsão de referência por de-biasing puro: lag1_observado / p_capt.
+    As colunas de X seguem a ordem de make_features: [sin,cos,hora,ma,rel,
+    lag1,...,lagL, onehot...]. Logo rel=col 4 e lag1=col 5.'''
+    rel_col = X[:, 4]
+    lag1 = X[:, 5]
+    return lag1 / np.maximum(rel_col, 0.05)
+
+
+print("Pipeline preditivo PTO definido (features, de-biasing e treino).")
+"""),
+        code(r"""
+def solve_allocation_mip(demand_hat, K, c, prev_alloc=None,
+                         lam_idle=0.0, lam_repos=0.0, timeout=5.0):
+    '''Resolve o MIP de alocação de UM passo dado a demanda estimada por zona.
+
+        max  sum_z served_z - lam_idle*idle_z - lam_repos*|a_z - prev_z|
+        s.a. served_z <= demand_hat_z ; served_z <= c*a_z
+             sum_z a_z <= K ; a_z inteiro >= 0
+
+    Backend: Gurobi se disponível, senão CBC (PuLP). Retorna vetor a (Z,).
+    '''
+    Z = len(demand_hat)
+    prev = np.zeros(Z) if prev_alloc is None else np.asarray(prev_alloc, float)
+
+    if SOLVER_BACKEND == "gurobi":
+        m = gp.Model("alloc"); m.Params.OutputFlag = 0
+        m.Params.TimeLimit = timeout
+        a = m.addVars(Z, vtype=GRB.INTEGER, lb=0, name="a")
+        s = m.addVars(Z, lb=0, name="served")
+        dev = m.addVars(Z, lb=0, name="dev")  # |a - prev|
+        m.addConstr(gp.quicksum(a[z] for z in range(Z)) <= K)
+        for z in range(Z):
+            m.addConstr(s[z] <= demand_hat[z])
+            m.addConstr(s[z] <= c * a[z])
+            idle_z = c * a[z] - s[z]
+            m.addConstr(dev[z] >= a[z] - prev[z])
+            m.addConstr(dev[z] >= prev[z] - a[z])
+            _ = idle_z
+        obj = gp.quicksum(
+            s[z] - lam_idle * (c * a[z] - s[z]) - lam_repos * dev[z]
+            for z in range(Z))
+        m.setObjective(obj, GRB.MAXIMIZE)
+        m.optimize()
+        if m.SolCount == 0:
+            return waterfill_alloc(np.asarray(demand_hat), K, c)  # fallback viável
+        return np.array([int(round(a[z].X)) for z in range(Z)], dtype=np.int32)
+
+    # ---- fallback CBC via PuLP ----
+    prob = pulp.LpProblem("alloc", pulp.LpMaximize)
+    a = [pulp.LpVariable(f"a_{z}", lowBound=0, cat="Integer") for z in range(Z)]
+    s = [pulp.LpVariable(f"s_{z}", lowBound=0) for z in range(Z)]
+    dev = [pulp.LpVariable(f"d_{z}", lowBound=0) for z in range(Z)]
+    prob += pulp.lpSum(s[z] - lam_idle * (c * a[z] - s[z]) - lam_repos * dev[z]
+                       for z in range(Z))
+    prob += pulp.lpSum(a) <= K
+    for z in range(Z):
+        prob += s[z] <= demand_hat[z]
+        prob += s[z] <= c * a[z]
+        prob += dev[z] >= a[z] - prev[z]
+        prob += dev[z] >= prev[z] - a[z]
+    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=timeout))
+    if pulp.LpStatus[prob.status] not in ("Optimal", "Not Solved"):
+        return waterfill_alloc(np.asarray(demand_hat), K, c)
+    return np.array([int(round(a[z].value() or 0)) for z in range(Z)], dtype=np.int32)
+
+
+print("MIP de alocação de um passo definido (Gurobi/CBC).")
+"""),
+        code(r"""
+def make_pto_policy(model, reliability, n_lags, cfg):
+    '''Cria a política PTO: a cada passo monta features do estado, prevê a
+    demanda real e resolve o MIP de alocação. Para t < n_lags (sem lags
+    suficientes) cai no de-biasing simples sobre a última observada.
+    '''
+    steps_per_hour = 60 // cfg.step_minutes
+    Z = cfg.n_zones
+
+    def _policy(obs, cfg):
+        t, T = obs["t"], obs["T"]
+        hist = obs["obs_history"]  # (t, Z) observadas de 0..t-1
+        hour = t // steps_per_hour
+        if t < n_lags:
+            # pouca história: de-biasing da última observada (ou uniforme)
+            last = obs["last_obs"].astype(float)
+            dhat = last / np.clip(reliability[:, hour], 0.05, 1.0)
+            if dhat.sum() <= 0:
+                base, rem = divmod(cfg.fleet_K, Z)
+                a = np.full(Z, base, dtype=np.int32); a[:rem] += 1
+                return a
+            return solve_allocation_mip(dhat, cfg.fleet_K, cfg.service_c,
+                                        obs["prev_alloc"], cfg.lambda_idle,
+                                        cfg.lambda_repos, cfg.mip_timeout_s)
+        ang = 2 * np.pi * t / T
+        sin_t, cos_t = math.sin(ang), math.cos(ang)
+        feats = []
+        for z in range(Z):
+            lags = [hist[t - k, z] for k in range(1, n_lags + 1)]
+            ma = float(np.mean(lags))
+            zone_oh = [1.0 if zz == z else 0.0 for zz in range(Z)]
+            feats.append([sin_t, cos_t, hour / 23.0, ma, reliability[z, hour]]
+                         + lags + zone_oh)
+        dhat = np.clip(model.predict(np.asarray(feats, float)), 0, None)
+        return solve_allocation_mip(dhat, cfg.fleet_K, cfg.service_c,
+                                    obs["prev_alloc"], cfg.lambda_idle,
+                                    cfg.lambda_repos, cfg.mip_timeout_s)
+    return _policy
+
+
+# Treina um preditor por cenário e avalia a política PTO no TESTE.
+print("Treinando preditores PTO e avaliando no teste:")
+pto_models, pto_results = {}, {}
+for key in ["alta", "media", "baixa"]:
+    mdl, rel, nl = fit_pto_predictor(CONFIG, key)
+    pto_models[key] = (mdl, rel, nl)
+    policy = make_pto_policy(mdl, rel, nl, CONFIG)
+    res = run_policy_on_days(policy, D_real[SPLIT["test"]],
+                             D_OBS[key][SPLIT["test"]], CONFIG)
+    pto_results[key] = res
+    print(f"  [PTO:{key}] disponibilidade={res['availability']:.3f} "
+          f"| decisão={res['mean_decision_ms']:.2f} ms")
+"""),
+    ]
+
+
+# ===========================================================================
 # MONTAGEM DO NOTEBOOK
 # ===========================================================================
 def build():
@@ -771,6 +1012,7 @@ def build():
     add(section_1())
     add(section_2())
     add(section_3())
+    add(section_4())
 
     nb = new_notebook()
     nb.cells = CELLS
