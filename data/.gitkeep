@@ -1,0 +1,3 @@
+# Diretório de cache dos dados do NYC TLC.
+# O conteúdo (arquivos .parquet) é ignorado pelo Git (ver .gitignore).
+# O notebook baixa os dados aqui na primeira execução.

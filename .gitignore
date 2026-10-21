@@ -1,8 +1,8 @@
 # ---- Dados (não versionar arquivos grandes do TLC) ----
-data/
+data/*
+!data/.gitkeep
 *.parquet
 *.csv
-!data/.gitkeep
 
 # ---- Python ----
 __pycache__/
