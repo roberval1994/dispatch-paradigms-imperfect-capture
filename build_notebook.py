@@ -1005,6 +1005,271 @@ for key in ["alta", "media", "baixa"]:
 
 
 # ===========================================================================
+# SEÇÃO 5 — Paradigma 2: Reinforcement Learning
+# ===========================================================================
+def section_5():
+    return [
+        md(r"""
+## Seção 5 — Paradigma 2: Reinforcement Learning (Actor-Critic)
+
+Aqui a decisão não passa por uma previsão explícita: o agente aprende uma política
+$\pi_\theta(a_t \mid s_t)$ que mapeia o estado diretamente em alocação, maximizando
+o retorno descontado da recompensa. Isso permite que o agente aprenda, de forma
+implícita, a **compensar o viés de captação** apenas a partir do sinal de recompensa.
+
+### 5.1 Formulação como MDP
+
+- **Estado** $s_t$ (apenas informação legítima em $t$):
+  calendário ($\sin, \cos$ do passo, hora normalizada), *lags* normalizados da
+  demanda **observada**, confiabilidade de captação estimada $\hat p^{capt}_{z,h}$
+  e a alocação anterior normalizada.
+- **Ação** $a_t$: alocação inteira de $K$ veículos nas $Z$ zonas. Para tornar o
+  espaço tratável, o ator emite **logits** por zona → *softmax* → proporções
+  $w_z$; a alocação inteira é obtida por *largest-remainder* (apportionment) com
+  $\sum_z a_z = K$. A exploração vem de amostrar $w$ de uma **Dirichlet**
+  concentrada nos logits durante o treino.
+- **Recompensa** $r_t = \sum_z \min(D_{z,t}, c\,a_{z,t})$ — exatamente a demanda
+  **real** atendida no passo, normalizada por um fator de escala. Alinhada à
+  disponibilidade.
+- **Transição**: determinística no relógio; a aleatoriedade está na demanda.
+
+### 5.2 Algoritmo
+
+**Advantage Actor-Critic (A2C)** implementado do zero em PyTorch:
+ator (política) + crítico (estimador de valor $V_\psi(s)$), vantagem
+$A_t = G_t - V_\psi(s_t)$, com retornos descontados $G_t$, entropia para
+exploração e *gradient clipping*. Sementes fixas garantem reprodutibilidade.
+"""),
+        code(r"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+DEVICE = torch.device("cpu")  # ambiente é CPU-only; mantém determinismo
+
+
+def largest_remainder_alloc(weights: np.ndarray, K: int) -> np.ndarray:
+    '''Converte proporções (somam 1) em alocação inteira com soma exata K
+    pelo método do maior resto (apportionment de Hamilton). Determinístico.'''
+    raw = weights * K
+    base = np.floor(raw).astype(int)
+    rem = K - base.sum()
+    if rem > 0:
+        order = np.argsort(-(raw - base))  # maiores restos primeiro
+        base[order[:rem]] += 1
+    return base.astype(np.int32)
+
+
+print(f"PyTorch {torch.__version__} | device={DEVICE}")
+print("Apportionment largest-remainder definido.")
+"""),
+        code(r"""
+class RLState:
+    '''Constrói o vetor de estado s_t a partir da observação do ambiente,
+    usando só informação legítima. Mantém a mesma ordenação de features no
+    treino e na execução (crucial para coerência).'''
+
+    def __init__(self, cfg, reliability, n_lags=3, demand_scale=None):
+        self.cfg = cfg
+        self.rel = reliability            # (Z, 24)
+        self.n_lags = n_lags
+        self.Z = cfg.n_zones
+        self.steps_per_hour = 60 // cfg.step_minutes
+        # escala de normalização dos lags/recompensa (robustez numérica)
+        self.demand_scale = demand_scale or 1.0
+
+    @property
+    def dim(self):
+        # [sin, cos, hora] + lags*Z + rel_hora*Z + prev_alloc*Z
+        return 3 + self.n_lags * self.Z + self.Z + self.Z
+
+    def build(self, obs) -> np.ndarray:
+        t, T = obs["t"], obs["T"]
+        hour = t // self.steps_per_hour
+        ang = 2 * np.pi * t / T
+        hist = obs["obs_history"]
+        feats = [math.sin(ang), math.cos(ang), hour / 23.0]
+        for k in range(1, self.n_lags + 1):
+            if t - k >= 0:
+                feats.extend((hist[t - k] / self.demand_scale).tolist())
+            else:
+                feats.extend([0.0] * self.Z)
+        feats.extend(self.rel[:, hour].tolist())
+        feats.extend((obs["prev_alloc"] / max(self.cfg.fleet_K, 1)).tolist())
+        return np.asarray(feats, dtype=np.float32)
+
+
+class ActorCritic(nn.Module):
+    '''Rede compartilhada com duas cabeças: ator (logits por zona) e crítico
+    (valor escalar do estado).'''
+
+    def __init__(self, state_dim, n_zones, hidden=128):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self.actor_head = nn.Linear(hidden, n_zones)
+        self.critic_head = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        h = self.body(x)
+        logits = self.actor_head(h)
+        value = self.critic_head(h).squeeze(-1)
+        return logits, value
+
+
+print("RLState e ActorCritic definidos.")
+"""),
+        code(r"""
+def train_rl_agent(cfg, scenario_key, verbose=True):
+    '''Treina um agente A2C para um cenário de captação.
+
+    - Episódio = um dia de TREINO (amostrado aleatoriamente).
+    - Política: logits -> Dirichlet(alpha=softmax(logits)*conc) p/ exploração;
+      proporções -> largest_remainder -> alocação inteira (soma = K).
+    - Vantagem = retorno descontado - valor do crítico.
+    - Early-stop por disponibilidade de VALIDAÇÃO.
+    Retorna (modelo, state_builder, hist_val).
+    '''
+    set_global_seed()
+    tr, va = SPLIT["train"], SPLIT["val"]
+    rel = build_capture_reliability(D_real[tr], D_OBS[scenario_key][tr], cfg)
+    scale = max(1.0, float(D_OBS[scenario_key][tr].mean()))
+    sb = RLState(cfg, rel, n_lags=3, demand_scale=scale)
+
+    torch.manual_seed(GLOBAL_SEED)
+    net = ActorCritic(sb.dim, cfg.n_zones).to(DEVICE)
+    opt = torch.optim.Adam(net.parameters(), lr=cfg.rl_lr)
+    reward_scale = float(D_real[tr].sum(axis=2).mean()) or 1.0
+    concentration = 8.0  # concentração da Dirichlet (↑ = menos exploração)
+    rng = np.random.default_rng(GLOBAL_SEED)
+
+    best_val, best_state, hist_val = -1.0, None, []
+
+    def rollout_day(day_real, day_obs, train=True):
+        env = DispatchEnv(day_real, day_obs, cfg)
+        obs = env.reset()
+        logps, values, entropies, rewards = [], [], [], []
+        done = False
+        while not done:
+            s = torch.from_numpy(sb.build(obs)).to(DEVICE)
+            logits, value = net(s)
+            probs = F.softmax(logits, dim=-1)
+            if train:
+                alpha = probs.detach().cpu().numpy() * concentration + 1e-3
+                w = rng.dirichlet(alpha)
+                # Projeta no interior do simplex: evita componentes 0/1 que
+                # caem fora do suporte da Dirichlet e geram log_prob = +/-inf.
+                w = np.clip(w, 1e-6, None)
+                w = w / w.sum()
+                dist = torch.distributions.Dirichlet(probs * concentration + 1e-3)
+                w_t = torch.from_numpy(w.astype(np.float32))
+                logp = dist.log_prob(w_t)
+                ent = dist.entropy()
+            else:
+                w = probs.detach().cpu().numpy()
+                logp = torch.tensor(0.0); ent = torch.tensor(0.0)
+            a = largest_remainder_alloc(w, cfg.fleet_K)
+            obs, reward, done, info = env.step(a)
+            logps.append(logp); values.append(value)
+            entropies.append(ent); rewards.append(reward / reward_scale)
+        return logps, values, entropies, rewards, env
+
+    for ep in range(cfg.rl_episodes):
+        d = int(rng.integers(len(tr)))
+        logps, values, entropies, rewards, _ = rollout_day(
+            D_real[tr][d], D_OBS[scenario_key][tr][d], train=True)
+
+        # retornos descontados
+        G, returns = 0.0, []
+        for r in reversed(rewards):
+            G = r + cfg.rl_gamma * G
+            returns.append(G)
+        returns = torch.tensor(list(reversed(returns)), dtype=torch.float32)
+        values_t = torch.stack(values)
+        logps_t = torch.stack(logps)
+        ent_t = torch.stack(entropies)
+
+        adv = returns - values_t.detach()
+        actor_loss = -(logps_t * adv).mean()
+        critic_loss = F.mse_loss(values_t, returns)
+        loss = actor_loss + 0.5 * critic_loss - 0.01 * ent_t.mean()
+
+        opt.zero_grad(); loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+
+        # validação periódica (greedy)
+        if (ep + 1) % 25 == 0 or ep == cfg.rl_episodes - 1:
+            net.eval()
+            A = np.zeros_like(D_real[va])
+            with torch.no_grad():
+                for dv in range(len(va)):
+                    *_unused, env = rollout_day(
+                        D_real[va][dv], D_OBS[scenario_key][va][dv], train=False)
+                    A[dv] = env.alloc_hist
+            av = availability(D_real[va], A, cfg.service_c)
+            hist_val.append((ep + 1, av))
+            if av > best_val:
+                best_val = av
+                best_state = {k: v.clone() for k, v in net.state_dict().items()}
+            net.train()
+            if verbose:
+                print(f"    ep {ep+1:3d} | val disponibilidade = {av:.3f} "
+                      f"(melhor {best_val:.3f})")
+
+    if best_state is not None:
+        net.load_state_dict(best_state)
+    net.eval()
+    return net, sb, hist_val
+
+
+print("Loop de treino A2C definido (train_rl_agent).")
+"""),
+        code(r"""
+def make_rl_policy(net, state_builder, cfg):
+    '''Política RL de execução (greedy): usa as proporções da softmax do ator
+    diretamente, sem exploração, e converte em alocação inteira (soma = K).'''
+    def _policy(obs, cfg):
+        s = torch.from_numpy(state_builder.build(obs)).to(DEVICE)
+        with torch.no_grad():
+            logits, _ = net(s)
+            w = F.softmax(logits, dim=-1).cpu().numpy()
+        return largest_remainder_alloc(w, cfg.fleet_K)
+    return _policy
+
+
+# Treina um agente por cenário e avalia no TESTE. Sementes fixas -> reprodutível.
+print("Treinando agentes RL (A2C) por cenário e avaliando no teste:")
+rl_agents, rl_results, rl_curves = {}, {}, {}
+for key in ["alta", "media", "baixa"]:
+    print(f"  Cenário {key}:")
+    net, sb, curve = train_rl_agent(CONFIG, key, verbose=True)
+    rl_agents[key] = (net, sb)
+    rl_curves[key] = curve
+    policy = make_rl_policy(net, sb, CONFIG)
+    res = run_policy_on_days(policy, D_real[SPLIT["test"]],
+                             D_OBS[key][SPLIT["test"]], CONFIG)
+    rl_results[key] = res
+    print(f"  [RL:{key}] disponibilidade={res['availability']:.3f} "
+          f"| decisão={res['mean_decision_ms']:.2f} ms")
+"""),
+        code(r"""
+# Curvas de aprendizado (disponibilidade de validação ao longo dos episódios).
+fig, ax = plt.subplots()
+for key in ["alta", "media", "baixa"]:
+    if rl_curves[key]:
+        eps, avs = zip(*rl_curves[key])
+        ax.plot(eps, avs, marker="o", ms=3, label=f"{key}")
+ax.set_xlabel("Episódio"); ax.set_ylabel("Disponibilidade (validação)")
+ax.set_title("Curvas de aprendizado do agente A2C por cenário de captação")
+ax.legend(); plt.tight_layout(); plt.show()
+"""),
+    ]
+
+
+# ===========================================================================
 # MONTAGEM DO NOTEBOOK
 # ===========================================================================
 def build():
@@ -1013,6 +1278,7 @@ def build():
     add(section_2())
     add(section_3())
     add(section_4())
+    add(section_5())
 
     nb = new_notebook()
     nb.cells = CELLS
