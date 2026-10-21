@@ -1270,6 +1270,191 @@ ax.legend(); plt.tight_layout(); plt.show()
 
 
 # ===========================================================================
+# SEÇÃO 6 — Paradigma 3: MIP/Online com reotimização (rolling horizon)
+# ===========================================================================
+def section_6():
+    return [
+        md(r"""
+## Seção 6 — Paradigma 3: MIP/Online com reotimização
+
+Diferente do PTO (que resolve um subproblema **de um passo** com uma previsão
+sofisticada), o paradigma MIP/Online explora a **estrutura temporal** da decisão:
+a cada passo resolve um MIP **multi-período** sobre a janela $[t, t+H]$, aplica
+apenas a decisão do passo corrente e **reotimiza** no passo seguinte com a
+informação atualizada (*rolling / receding horizon*).
+
+### 6.1 Previsão leve e online
+
+Para isolar o efeito da **reotimização** (e não o da sofisticação preditiva, já
+coberta pelo PTO), a previsão da demanda futura na janela usa um estimador leve e
+*online*: média móvel da demanda **observada** recente, corrigida pela
+confiabilidade de captação $\hat p^{capt}_{z,h}$ e por um fator sazonal horário.
+
+### 6.2 MIP multi-período
+
+$$
+\max \sum_{\tau=t}^{t+H}\sum_z \Big[\min(\hat D_{z,\tau}, c\,a_{z,\tau})\Big]
+- \lambda_{\text{repos}} \sum_{\tau} \sum_z |a_{z,\tau} - a_{z,\tau-1}|
+$$
+
+sujeito a $\sum_z a_{z,\tau} \le K$ para todo $\tau$, acoplamento de reposicionamento
+entre passos consecutivos e integralidade. Apenas $a_{\cdot,t}$ é aplicado.
+
+### 6.3 Robustez operacional
+
+- **Timeout** por reotimização (`mip_timeout_s`): se o solver não prova otimalidade,
+  usamos a melhor solução incumbente; se não há solução, caímos em um *fallback*
+  viável (*waterfill* do passo corrente).
+- **Viabilidade garantida**: as restrições sempre admitem $a=0$; logo o modelo
+  nunca é inviável. Monitoramos *status*, *gap* e número de *timeouts*.
+"""),
+        code(r"""
+def forecast_window(obs, reliability, cfg, H):
+    '''Previsão leve e online da demanda REAL para a janela [t, t+H].
+
+    Usa a média da demanda observada recente (de-enviesada por reliability) como
+    nível e a replica na janela. Mantém-se simples de propósito: o foco do
+    paradigma é a reotimização, não a sofisticação preditiva (coberta pelo PTO).
+
+    Retorna matriz Dhat (H+1, Z).
+    '''
+    t = obs["t"]
+    Z = cfg.n_zones
+    steps_per_hour = 60 // cfg.step_minutes
+    hist = obs["obs_history"]  # (t, Z)
+
+    # nível: média das últimas W observadas, de-enviesada pela confiabilidade
+    W = 4
+    if t > 0:
+        recent = hist[max(0, t - W):t].astype(float)
+        hour_now = t // steps_per_hour
+        level = recent.mean(axis=0) / np.clip(reliability[:, hour_now], 0.05, 1.0)
+    else:
+        level = np.zeros(Z)
+
+    # Replica o nível de-enviesado ao longo da janela (perfil plano, online).
+    Dhat = np.tile(np.clip(level, 0, None), (H + 1, 1))
+    return Dhat
+
+
+print("Previsão online de janela definida (forecast_window).")
+"""),
+        code(r"""
+def solve_rolling_mip(Dhat, K, c, prev_alloc, cfg):
+    '''Resolve o MIP multi-período sobre a janela e devolve (a_first, meta).
+
+    Dhat : (H+1, Z) demanda estimada na janela.
+    Aplica timeout; em timeout usa incumbente; sem solução -> fallback waterfill.
+    meta: dict com status, gap, tempo, flag de timeout.
+    '''
+    Hp1, Z = Dhat.shape
+    prev = np.asarray(prev_alloc, float)
+    lam = cfg.lambda_repos
+    t0 = time.perf_counter()
+
+    if SOLVER_BACKEND == "gurobi":
+        m = gp.Model("rolling"); m.Params.OutputFlag = 0
+        m.Params.TimeLimit = cfg.mip_timeout_s
+        a = m.addVars(Hp1, Z, vtype=GRB.INTEGER, lb=0, name="a")
+        s = m.addVars(Hp1, Z, lb=0, name="s")
+        dev = m.addVars(Hp1, Z, lb=0, name="dev")
+        for k in range(Hp1):
+            m.addConstr(gp.quicksum(a[k, z] for z in range(Z)) <= K)
+            for z in range(Z):
+                m.addConstr(s[k, z] <= Dhat[k, z])
+                m.addConstr(s[k, z] <= c * a[k, z])
+                prev_kz = prev[z] if k == 0 else a[k - 1, z]
+                m.addConstr(dev[k, z] >= a[k, z] - prev_kz)
+                m.addConstr(dev[k, z] >= prev_kz - a[k, z])
+        obj = gp.quicksum(s[k, z] - lam * dev[k, z]
+                          for k in range(Hp1) for z in range(Z))
+        m.setObjective(obj, GRB.MAXIMIZE)
+        m.optimize()
+        wall = time.perf_counter() - t0
+        timed_out = (m.Status == GRB.TIME_LIMIT)
+        if m.SolCount == 0:
+            a_first = waterfill_alloc(Dhat[0], K, c)
+            return a_first, {"status": "no_sol->fallback", "gap": None,
+                             "time": wall, "timeout": True}
+        a_first = np.array([int(round(a[0, z].X)) for z in range(Z)], dtype=np.int32)
+        gap = m.MIPGap if m.SolCount > 0 else None
+        return a_first, {"status": int(m.Status), "gap": float(gap),
+                         "time": wall, "timeout": bool(timed_out)}
+
+    # ---- fallback CBC via PuLP ----
+    prob = pulp.LpProblem("rolling", pulp.LpMaximize)
+    a = {(k, z): pulp.LpVariable(f"a_{k}_{z}", lowBound=0, cat="Integer")
+         for k in range(Hp1) for z in range(Z)}
+    s = {(k, z): pulp.LpVariable(f"s_{k}_{z}", lowBound=0)
+         for k in range(Hp1) for z in range(Z)}
+    dev = {(k, z): pulp.LpVariable(f"d_{k}_{z}", lowBound=0)
+           for k in range(Hp1) for z in range(Z)}
+    prob += pulp.lpSum(s[k, z] - lam * dev[k, z]
+                       for k in range(Hp1) for z in range(Z))
+    for k in range(Hp1):
+        prob += pulp.lpSum(a[k, z] for z in range(Z)) <= K
+        for z in range(Z):
+            prob += s[k, z] <= Dhat[k, z]
+            prob += s[k, z] <= c * a[k, z]
+            prev_kz = prev[z] if k == 0 else a[k - 1, z]
+            prob += dev[k, z] >= a[k, z] - prev_kz
+            prob += dev[k, z] >= prev_kz - a[k, z]
+    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=cfg.mip_timeout_s))
+    wall = time.perf_counter() - t0
+    status = pulp.LpStatus[prob.status]
+    if status not in ("Optimal", "Not Solved", "Undefined"):
+        return waterfill_alloc(Dhat[0], K, c), {"status": status, "gap": None,
+                                                "time": wall, "timeout": True}
+    a_first = np.array([int(round(a[0, z].value() or 0)) for z in range(Z)],
+                       dtype=np.int32)
+    return a_first, {"status": status, "gap": None, "time": wall,
+                     "timeout": status == "Not Solved"}
+
+
+print("MIP multi-período (rolling horizon) definido (solve_rolling_mip).")
+"""),
+        code(r"""
+def make_online_mip_policy(reliability, cfg):
+    '''Cria a política MIP/Online: a cada passo prevê a janela, resolve o MIP
+    multi-período, aplica só o primeiro passo e acumula metadados de solver.'''
+    meta_log = {"timeouts": 0, "gaps": [], "times": [], "n": 0}
+
+    def _policy(obs, cfg):
+        Dhat = forecast_window(obs, reliability, cfg, cfg.horizon_H)
+        a_first, meta = solve_rolling_mip(Dhat, cfg.fleet_K, cfg.service_c,
+                                          obs["prev_alloc"], cfg)
+        meta_log["n"] += 1
+        meta_log["timeouts"] += int(bool(meta.get("timeout")))
+        if meta.get("gap") is not None:
+            meta_log["gaps"].append(meta["gap"])
+        meta_log["times"].append(meta["time"])
+        return a_first
+
+    _policy.meta_log = meta_log
+    return _policy
+
+
+# Avalia o paradigma MIP/Online no TESTE, por cenário de captação.
+print("Executando MIP/Online (rolling horizon) por cenário e avaliando no teste:")
+online_results, online_meta = {}, {}
+for key in ["alta", "media", "baixa"]:
+    rel = build_capture_reliability(D_real[SPLIT["train"]],
+                                    D_OBS[key][SPLIT["train"]], CONFIG)
+    policy = make_online_mip_policy(rel, CONFIG)
+    res = run_policy_on_days(policy, D_real[SPLIT["test"]],
+                             D_OBS[key][SPLIT["test"]], CONFIG)
+    online_results[key] = res
+    ml = policy.meta_log
+    online_meta[key] = ml
+    gap_mean = (np.mean(ml["gaps"]) if ml["gaps"] else 0.0)
+    print(f"  [MIP/Online:{key}] disponibilidade={res['availability']:.3f} "
+          f"| decisão={res['mean_decision_ms']:.1f} ms "
+          f"| timeouts={ml['timeouts']}/{ml['n']} | gap médio={gap_mean:.4f}")
+"""),
+    ]
+
+
+# ===========================================================================
 # MONTAGEM DO NOTEBOOK
 # ===========================================================================
 def build():
@@ -1279,6 +1464,7 @@ def build():
     add(section_3())
     add(section_4())
     add(section_5())
+    add(section_6())
 
     nb = new_notebook()
     nb.cells = CELLS
