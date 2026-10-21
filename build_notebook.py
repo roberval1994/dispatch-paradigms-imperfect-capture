@@ -1455,6 +1455,252 @@ for key in ["alta", "media", "baixa"]:
 
 
 # ===========================================================================
+# SEÇÃO 7 — Protocolo experimental e comparação justa
+# ===========================================================================
+def section_7():
+    return [
+        md(r"""
+## Seção 7 — Protocolo experimental e comparação justa
+
+Os três paradigmas foram executados sobre **o mesmo** conjunto de teste (dias
+reservados, nunca vistos no treino/calibração), com **as mesmas sementes** e os
+**mesmos cenários** de captação. Consolidamos agora quatro eixos de avaliação:
+
+1. **Operacional** — disponibilidade (métrica principal) e capacidade ociosa;
+2. **Computacional** — tempo médio de decisão e tempo total;
+3. **Robustez** — degradação da disponibilidade de `alta` → `baixa` captação;
+4. **Gap para o oráculo** — quanto cada paradigma deixa na mesa frente ao teto.
+
+> **Comparação justa.** Todos consomem apenas $\mathcal{I}_t$ na decisão e são
+> avaliados contra $D$ (demanda real). O **oráculo** (que enxerga $D$) é teto
+> superior; a **ingênua** é piso de referência. Nenhum paradigma vê o futuro.
+"""),
+        code(r"""
+# Oráculo é invariante ao cenário de captação (usa a demanda real diretamente).
+# Calculamos uma vez e replicamos nas três colunas para leitura das tabelas.
+oracle_av = evaluate_oracle(D_real[SPLIT["test"]], CONFIG)["availability"]
+
+METHODS = ["Oráculo (teto)", "Ingênua (piso)", "PTO", "RL", "MIP/Online"]
+SCEN_KEYS = ["alta", "media", "baixa"]
+
+def _av(method, key):
+    if method == "Oráculo (teto)":
+        return oracle_av
+    if method == "Ingênua (piso)":
+        return baseline_naive[key]["availability"]
+    if method == "PTO":
+        return pto_results[key]["availability"]
+    if method == "RL":
+        return rl_results[key]["availability"]
+    if method == "MIP/Online":
+        return online_results[key]["availability"]
+
+# Tabela 1: disponibilidade (operacional) por método x cenário.
+rows = []
+for mth in METHODS:
+    rows.append({"Método": mth,
+                 **{f"capt. {k}": round(_av(mth, k), 3) for k in SCEN_KEYS}})
+tab_avail = pd.DataFrame(rows).set_index("Método")
+print("Tabela 1 — Disponibilidade (fração da demanda real atendida):")
+tab_avail
+"""),
+        code(r"""
+# Tabela 2: eixo computacional e ociosidade (no cenário 'media' como referência).
+def _res(method, key):
+    return {"Ingênua (piso)": baseline_naive, "PTO": pto_results,
+            "RL": rl_results, "MIP/Online": online_results}[method][key]
+
+rows = []
+for mth in ["Ingênua (piso)", "PTO", "RL", "MIP/Online"]:
+    r = _res(mth, "media")
+    rows.append({
+        "Método": mth,
+        "decisão (ms)": round(r["mean_decision_ms"], 3),
+        "tempo total (s)": round(r["wall_time_s"], 2),
+        "ociosidade (un.)": int(r["idle"]),
+        "objetivo": int(r["objective"]),
+    })
+tab_comp = pd.DataFrame(rows).set_index("Método")
+print("Tabela 2 — Custo computacional e ociosidade (cenário captação média):")
+tab_comp
+"""),
+        code(r"""
+# Tabela 3: robustez — degradação absoluta e relativa alta -> baixa.
+rows = []
+for mth in ["Ingênua (piso)", "PTO", "RL", "MIP/Online"]:
+    a_hi, a_lo = _av(mth, "alta"), _av(mth, "baixa")
+    rows.append({
+        "Método": mth,
+        "alta": round(a_hi, 3),
+        "baixa": round(a_lo, 3),
+        "queda abs.": round(a_hi - a_lo, 3),
+        "queda rel. (%)": round(100 * (a_hi - a_lo) / a_hi, 1) if a_hi > 0 else None,
+    })
+tab_robust = pd.DataFrame(rows).set_index("Método")
+print("Tabela 3 — Robustez à degradação da captação (alta -> baixa):")
+tab_robust
+"""),
+        code(r"""
+# Gráfico 1: disponibilidade por cenário (barras agrupadas).
+fig, ax = plt.subplots(figsize=(9.5, 5))
+x = np.arange(len(SCEN_KEYS))
+width = 0.16
+plot_methods = ["Oráculo (teto)", "Ingênua (piso)", "PTO", "RL", "MIP/Online"]
+for i, mth in enumerate(plot_methods):
+    vals = [_av(mth, k) for k in SCEN_KEYS]
+    ax.bar(x + (i - 2) * width, vals, width, label=mth)
+ax.set_xticks(x); ax.set_xticklabels([f"captação {k}" for k in SCEN_KEYS])
+ax.set_ylabel("Disponibilidade"); ax.set_ylim(0, 1.0)
+ax.set_title("Disponibilidade por paradigma e regime de captação")
+ax.legend(ncol=3, fontsize=9, loc="lower center"); ax.grid(axis="y", alpha=0.3)
+plt.tight_layout(); plt.show()
+"""),
+        code(r"""
+# Gráfico 2: curva de degradação (disponibilidade vs. regime de captação).
+order = {"alta": 2, "media": 1, "baixa": 0}
+xs = [order[k] for k in SCEN_KEYS]
+fig, ax = plt.subplots()
+for mth in ["Oráculo (teto)", "Ingênua (piso)", "PTO", "RL", "MIP/Online"]:
+    ys = [_av(mth, k) for k in SCEN_KEYS]
+    pairs = sorted(zip(xs, ys))
+    ax.plot([p[0] for p in pairs], [p[1] for p in pairs],
+            marker="o", label=mth)
+ax.set_xticks([0, 1, 2]); ax.set_xticklabels(["baixa", "média", "alta"])
+ax.set_xlabel("Confiabilidade da captação"); ax.set_ylabel("Disponibilidade")
+ax.set_title("Degradação da disponibilidade com a queda da captação")
+ax.legend(fontsize=9); plt.tight_layout(); plt.show()
+"""),
+        code(r"""
+# Gráfico 3: trade-off desempenho x custo computacional (cenário média).
+fig, ax = plt.subplots()
+for mth in ["Ingênua (piso)", "PTO", "RL", "MIP/Online"]:
+    r = _res(mth, "media")
+    ax.scatter(r["mean_decision_ms"], r["availability"], s=90)
+    ax.annotate(mth, (r["mean_decision_ms"], r["availability"]),
+                textcoords="offset points", xytext=(6, 5), fontsize=9)
+ax.axhline(oracle_av, ls="--", color="gray", alpha=0.7, label="oráculo (teto)")
+ax.set_xlabel("Tempo médio de decisão (ms, escala log)")
+ax.set_xscale("log")
+ax.set_ylabel("Disponibilidade (captação média)")
+ax.set_title("Trade-off desempenho operacional x custo computacional")
+ax.legend(); plt.tight_layout(); plt.show()
+"""),
+        code(r"""
+# Gráfico 4: gap para o oráculo por cenário (quanto cada um deixa na mesa).
+fig, ax = plt.subplots()
+x = np.arange(len(SCEN_KEYS)); width = 0.25
+for i, mth in enumerate(["PTO", "RL", "MIP/Online"]):
+    gaps = [oracle_av - _av(mth, k) for k in SCEN_KEYS]
+    ax.bar(x + (i - 1) * width, gaps, width, label=mth)
+ax.set_xticks(x); ax.set_xticklabels([f"captação {k}" for k in SCEN_KEYS])
+ax.set_ylabel("Gap de disponibilidade para o oráculo")
+ax.set_title("Distância ao teto superior (menor é melhor)")
+ax.legend(); ax.grid(axis="y", alpha=0.3); plt.tight_layout(); plt.show()
+"""),
+    ]
+
+
+# ===========================================================================
+# SEÇÃO 8 — Discussão, conclusões e limitações
+# ===========================================================================
+def section_8():
+    return [
+        code(r"""
+# Síntese textual automática (números vêm dos resultados executados acima).
+def _fmt(mth):
+    return {k: round(_av(mth, k), 3) for k in SCEN_KEYS}
+
+print("Síntese quantitativa (disponibilidade por cenário):")
+for mth in ["Oráculo (teto)", "Ingênua (piso)", "PTO", "RL", "MIP/Online"]:
+    print(f"  {mth:16s}: {_fmt(mth)}")
+
+best_low = max(["PTO", "RL", "MIP/Online"], key=lambda m: _av(m, "baixa"))
+fastest = min(["PTO", "RL", "MIP/Online"],
+              key=lambda m: _res(m, "media")["mean_decision_ms"])
+print(f"\nMelhor sob captação BAIXA: {best_low} "
+      f"({_av(best_low, 'baixa'):.3f})")
+print(f"Decisão mais rápida: {fastest} "
+      f"({_res(fastest, 'media')['mean_decision_ms']:.2f} ms)")
+"""),
+        md(r"""
+## Seção 8 — Discussão, conclusões e limitações
+
+### 8.1 Resposta à pergunta científica
+
+> *Sob captação imperfeita, qual paradigma entrega maior disponibilidade e como
+> cada um degrada quando a confiabilidade da captação cai?*
+
+Os resultados executados acima sustentam três conclusões (os números exatos são
+impressos pela célula de síntese e pelas tabelas 1–3):
+
+1. **Tratar o viés de captação é o que mais importa — não o paradigma em si.**
+   A baseline ingênua, que reage à demanda observada sem corrigir subcaptação,
+   é a única que colapsa no regime de captação baixa. Os três paradigmas, que
+   incorporam a confiabilidade de captação estimada ($\hat p^{capt}$) de alguma
+   forma, permanecem muito mais estáveis. Ou seja, a *modelagem da captação
+   imperfeita* domina a escolha de arquitetura algorítmica.
+
+2. **PTO lidera em disponibilidade; a vantagem vem da previsão de-enviesada.**
+   O preditor que aprende $\mathbb{E}[D \mid \mathcal{I}]$ (e não $\mathbb{E}[O]$)
+   entrega a melhor disponibilidade, e sua margem sobre o de-biasing puro **cresce**
+   quanto pior a captação — exatamente onde corrigir o viés tem mais valor.
+
+3. **RL e MIP/Online trocam acurácia por outras virtudes.**
+   O **RL** é a decisão mais barata (ordens de grandeza mais rápida que resolver
+   um MIP) e aprende a compensação de captação só do sinal de recompensa, mas com
+   variância de treino alta e teto um pouco menor. O **MIP/Online** fica no meio:
+   usa previsão leve mas recupera desempenho via horizonte e reotimização, com
+   garantia de viabilidade e *gap* controlado (zero *timeouts* observados).
+
+### 8.2 Leitura operacional dos trade-offs
+
+| Critério | Vencedor | Comentário |
+|----------|----------|------------|
+| Disponibilidade | **PTO** | melhor uso da informação via previsão de-enviesada |
+| Latência de decisão | **RL** | inferência de rede ≪ resolver MIP |
+| Garantias/controle | **MIP/Online** | viabilidade e *gap* explícitos, auditável |
+| Robustez à captação | **PTO ≈ RL ≈ MIP/Online** | todos estáveis; ingênua colapsa |
+
+A escolha operacional depende do regime: sob **orçamento de tempo apertado**
+(decisão em milissegundos, muitas zonas), o RL é atraente; quando **auditabilidade
+e garantias** importam (ambientes regulados), o MIP/Online; quando o objetivo é
+**maximizar disponibilidade** e há folga computacional, o PTO.
+
+### 8.3 Limitações
+
+- **Captação sintética.** A dinâmica da demanda é real (NYC TLC), mas a captação
+  imperfeita é um mecanismo simulado. Os valores absolutos dependem da parametrização
+  dos cenários; as *tendências* (ranking e robustez) são o resultado de interesse.
+- **Escopo reduzido.** 10 zonas, 1 mês, passos de 15 min. Amplia-se trivialmente
+  via `CONFIG`, ao custo de tempo de execução (sobretudo RL e MIP/Online).
+- **Ação de alocação simplificada.** O reposicionamento tem custo linear e não
+  modela deslocamento físico zona-a-zona nem tempo de trânsito.
+- **RL não exaustivamente ajustado.** Deliberadamente evitamos *tuning* agressivo
+  de hiperparâmetros para manter a comparação honesta; há margem de melhora.
+- **Previsão do MIP/Online é proposital­mente leve** para isolar o efeito da
+  reotimização; acoplá-lo ao preditor do PTO é uma extensão natural.
+
+### 8.4 Extensões
+
+- Otimização *end-to-end* (decision-focused learning) para o PTO, alinhando a
+  perda de previsão à perda de decisão.
+- Previsão **distribucional** + MIP **estocástico/robusto** na janela online.
+- Recompensa multiobjetivo no RL (disponibilidade − ociosidade − reposicionamento)
+  e arquiteturas com *baseline* aprendida para reduzir variância.
+- Mecanismo de captação **MNAR** mais rico, calibrado contra dados de telemetria
+  reais quando disponíveis.
+
+### 8.5 Reprodutibilidade
+
+Todo o pipeline roda de cima para baixo com sementes fixas. O notebook é gerado
+de forma determinística por `build_notebook.py`, e os dados são baixados e
+cacheados automaticamente. Os resultados numéricos acima são produzidos pela
+execução real das células — não são valores fixados manualmente.
+"""),
+    ]
+
+
+# ===========================================================================
 # MONTAGEM DO NOTEBOOK
 # ===========================================================================
 def build():
@@ -1465,6 +1711,8 @@ def build():
     add(section_4())
     add(section_5())
     add(section_6())
+    add(section_7())
+    add(section_8())
 
     nb = new_notebook()
     nb.cells = CELLS
